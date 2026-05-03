@@ -14,26 +14,41 @@ import java.util.concurrent.*;
 @Component
 public class MarketDataHandler extends TextWebSocketHandler {
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final Map<WebSocketSession, Set<String>> subscriptions = new ConcurrentHashMap<>();
+    private final Map<WebSocketSession, SessionState> sessionStates = new ConcurrentHashMap<>();
     private final Map<String, AggregatedData> latestData = new ConcurrentHashMap<>();
     private final Map<WebSocketSession, Long> lastHeartbeat = new ConcurrentHashMap<>();
     
-    private final ScheduledExecutorService heartbeatScheduler = Executors.newScheduledThreadPool(2);
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
     private static final long HEARTBEAT_INTERVAL_MS = 5000;
     private static final long HEARTBEAT_TIMEOUT_MS = 15000;
+    private static final long DEFAULT_FRAME_INTERVAL_MS = 100;
+    private static final int DEFAULT_FPS = 10;
+
+    private final Map<WebSocketSession, Map<String, AggregatedData>> pendingUpdates = new ConcurrentHashMap<>();
+    private volatile long lastFlushTime = 0;
+
+    static class SessionState {
+        Set<String> subscriptions = new CopyOnWriteArraySet<>();
+        int targetFps = DEFAULT_FPS;
+        long lastSentTime = 0;
+
+        SessionState() {}
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
-        subscriptions.put(session, new CopyOnWriteArraySet<>());
+        sessionStates.put(session, new SessionState());
         lastHeartbeat.put(session, System.currentTimeMillis());
+        pendingUpdates.put(session, new ConcurrentHashMap<>());
         System.out.println("WebSocket connected: " + session.getId());
         
         startHeartbeatTask();
+        startUpdateDispatcher();
         sendWelcomeMessage(session);
     }
 
     private void startHeartbeatTask() {
-        heartbeatScheduler.scheduleAtFixedRate(() -> {
+        scheduler.scheduleAtFixedRate(() -> {
             try {
                 checkHeartbeats();
                 sendHeartbeats();
@@ -41,6 +56,60 @@ public class MarketDataHandler extends TextWebSocketHandler {
                 e.printStackTrace();
             }
         }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void startUpdateDispatcher() {
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                flushPendingUpdates();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, DEFAULT_FRAME_INTERVAL_MS, DEFAULT_FRAME_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void flushPendingUpdates() {
+        long now = System.currentTimeMillis();
+        
+        for (Map.Entry<WebSocketSession, SessionState> entry : sessionStates.entrySet()) {
+            WebSocketSession session = entry.getKey();
+            SessionState state = entry.getValue();
+            
+            if (!session.isOpen()) {
+                continue;
+            }
+
+            long frameInterval = 1000 / Math.max(1, state.targetFps);
+            if (now - state.lastSentTime < frameInterval) {
+                continue;
+            }
+
+            Map<String, AggregatedData> sessionPending = pendingUpdates.get(session);
+            if (sessionPending == null || sessionPending.isEmpty()) {
+                continue;
+            }
+
+            Map<String, AggregatedData> toSend = new HashMap<>(sessionPending);
+            sessionPending.clear();
+
+            List<AggregatedData> updates = new ArrayList<>();
+            for (String symbol : state.subscriptions) {
+                AggregatedData data = latestData.get(symbol);
+                if (data != null) {
+                    AggregatedData pending = toSend.get(symbol);
+                    if (pending != null) {
+                        updates.add(pending);
+                    } else {
+                        updates.add(data);
+                    }
+                }
+            }
+
+            if (!updates.isEmpty()) {
+                sendBatchUpdate(session, updates);
+                state.lastSentTime = now;
+            }
+        }
     }
 
     private void checkHeartbeats() {
@@ -68,7 +137,7 @@ public class MarketDataHandler extends TextWebSocketHandler {
         byte[] pingData = "ping".getBytes();
         ByteBuffer payload = ByteBuffer.wrap(pingData);
         
-        for (WebSocketSession session : subscriptions.keySet()) {
+        for (WebSocketSession session : sessionStates.keySet()) {
             if (session.isOpen()) {
                 try {
                     session.sendMessage(new PingMessage(payload));
@@ -87,35 +156,62 @@ public class MarketDataHandler extends TextWebSocketHandler {
         JsonNode json = objectMapper.readTree(payload);
         String action = json.path("action").asText();
         
-        if ("pong".equals(action)) {
-            lastHeartbeat.put(session, System.currentTimeMillis());
-            System.out.println("Received pong from client: " + session.getId());
-        } else if ("subscribe".equals(action)) {
-            handleSubscribe(session, json);
-        } else if ("ping".equals(action)) {
-            lastHeartbeat.put(session, System.currentTimeMillis());
+        switch (action) {
+            case "pong":
+                lastHeartbeat.put(session, System.currentTimeMillis());
+                break;
+            case "ping":
+                lastHeartbeat.put(session, System.currentTimeMillis());
+                break;
+            case "subscribe":
+                handleSubscribe(session, json);
+                break;
+            case "setFps":
+                handleSetFps(session, json);
+                break;
         }
+    }
+
+    private void handleSetFps(WebSocketSession session, JsonNode json) {
+        SessionState state = sessionStates.get(session);
+        if (state == null) {
+            return;
+        }
+
+        int fps = json.path("fps").asInt(DEFAULT_FPS);
+        fps = Math.max(1, Math.min(fps, 60));
+        state.targetFps = fps;
+        
+        System.out.println("Client " + session.getId() + " set FPS to: " + fps);
+        
+        sendAckMessage(session, "fps_set", fps);
     }
 
     @Override
     protected void handlePongMessage(WebSocketSession session, PongMessage message) {
         lastHeartbeat.put(session, System.currentTimeMillis());
-        System.out.println("Received pong from " + session.getId());
     }
 
     private void handleSubscribe(WebSocketSession session, JsonNode json) {
-        Set<String> symbols = subscriptions.computeIfAbsent(session, k -> new CopyOnWriteArraySet<>());
-        symbols.clear();
+        SessionState state = sessionStates.computeIfAbsent(session, k -> new SessionState());
+        state.subscriptions.clear();
         
         for (JsonNode node : json.path("symbols")) {
-            symbols.add(node.asText());
+            state.subscriptions.add(node.asText());
         }
-        System.out.println("Client " + session.getId() + " subscribed to: " + symbols);
         
-        symbols.forEach(symbol -> {
+        Integer requestedFps = json.has("fps") ? json.path("fps").asInt() : null;
+        if (requestedFps != null) {
+            requestedFps = Math.max(1, Math.min(requestedFps, 60));
+            state.targetFps = requestedFps;
+        }
+        
+        System.out.println("Client " + session.getId() + " subscribed to: " + state.subscriptions + " @ " + state.targetFps + " fps");
+        
+        state.subscriptions.forEach(symbol -> {
             AggregatedData data = latestData.get(symbol);
             if (data != null) {
-                sendUpdate(session, data);
+                pendingUpdates.computeIfAbsent(session, k -> new ConcurrentHashMap<>()).put(symbol, data);
             }
         });
     }
@@ -125,6 +221,21 @@ public class MarketDataHandler extends TextWebSocketHandler {
             Map<String, Object> message = new HashMap<>();
             message.put("type", "connected");
             message.put("sessionId", session.getId());
+            message.put("timestamp", System.currentTimeMillis());
+            message.put("defaultFps", DEFAULT_FPS);
+            String json = objectMapper.writeValueAsString(message);
+            session.sendMessage(new TextMessage(json));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void sendAckMessage(WebSocketSession session, String action, Object data) {
+        try {
+            Map<String, Object> message = new HashMap<>();
+            message.put("type", "ack");
+            message.put("action", action);
+            message.put("data", data);
             message.put("timestamp", System.currentTimeMillis());
             String json = objectMapper.writeValueAsString(message);
             session.sendMessage(new TextMessage(json));
@@ -140,28 +251,35 @@ public class MarketDataHandler extends TextWebSocketHandler {
     }
 
     private void cleanupSession(WebSocketSession session) {
-        subscriptions.remove(session);
+        sessionStates.remove(session);
         lastHeartbeat.remove(session);
+        pendingUpdates.remove(session);
     }
 
     public void broadcastUpdate(AggregatedData data) {
         latestData.put(data.getSymbol(), data);
-        subscriptions.forEach((session, symbols) -> {
-            if (session.isOpen() && symbols.contains(data.getSymbol())) {
-                sendUpdate(session, data);
+        
+        for (Map.Entry<WebSocketSession, SessionState> entry : sessionStates.entrySet()) {
+            WebSocketSession session = entry.getKey();
+            SessionState state = entry.getValue();
+            
+            if (session.isOpen() && state.subscriptions.contains(data.getSymbol())) {
+                pendingUpdates.computeIfAbsent(session, k -> new ConcurrentHashMap<>()).put(data.getSymbol(), data);
             }
-        });
+        }
     }
 
-    private void sendUpdate(WebSocketSession session, AggregatedData data) {
+    private void sendBatchUpdate(WebSocketSession session, List<AggregatedData> updates) {
         try {
             Map<String, Object> message = new HashMap<>();
-            message.put("type", "market_data");
-            message.put("data", data);
+            message.put("type", "batch_update");
+            message.put("count", updates.size());
+            message.put("data", updates);
+            message.put("timestamp", System.currentTimeMillis());
             String json = objectMapper.writeValueAsString(message);
             session.sendMessage(new TextMessage(json));
         } catch (IOException e) {
-            System.err.println("Error sending update to " + session.getId() + ": " + e.getMessage());
+            System.err.println("Error sending batch update to " + session.getId() + ": " + e.getMessage());
             cleanupSession(session);
         }
     }
