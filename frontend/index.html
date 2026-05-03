@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时行情系统</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .controls {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .controls label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: bold;
+            color: #333;
+        }
+        .symbols {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+        }
+        .symbol-btn {
+            padding: 10px 20px;
+            border: 2px solid #667eea;
+            background: white;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        .symbol-btn:hover {
+            background: #667eea;
+            color: white;
+        }
+        .symbol-btn.selected {
+            background: #667eea;
+            color: white;
+        }
+        #status {
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 5px;
+            margin-top: 10px;
+        }
+        .market-table {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 15px;
+            text-align: center;
+        }
+        th {
+            background: #667eea;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background: #f8f8f8;
+        }
+        .price-up {
+            color: #00c853;
+        }
+        .price-down {
+            color: #ff1744;
+        }
+        .updated {
+            animation: pulse 0.5s;
+        }
+        @keyframes pulse {
+            0%, 100% { background: inherit; }
+            50% { background: #fff9c4; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📈 实时行情系统</h1>
+        
+        <div class="controls">
+            <label>选择订阅的股票代码：</label>
+            <div class="symbols" id="symbols">
+                <button class="symbol-btn" data-symbol="000001">000001</button>
+                <button class="symbol-btn" data-symbol="600000">600000</button>
+                <button class="symbol-btn" data-symbol="000002">000002</button>
+                <button class="symbol-btn" data-symbol="600036">600036</button>
+            </div>
+            <div id="status">状态: 未连接</div>
+        </div>
+
+        <div class="market-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>股票代码</th>
+                        <th>最新价</th>
+                        <th>开盘价</th>
+                        <th>最高价</th>
+                        <th>最低价</th>
+                        <th>成交量</th>
+                    </tr>
+                </thead>
+                <tbody id="marketData">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
